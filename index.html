@@ -1,0 +1,1208 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+	<meta charset="utf-8"/>
+	<title>Crypto Signals — Regressão Linear no Browser (Vela Natural + Análise BB & Stoch)</title>
+
+	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+	<script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
+	<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon"></script>
+	<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial"></script>
+	
+	<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+	<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+
+
+	<style>
+		body { background:#071024; color:#e6f0ff; font-family: Inter, Arial; margin: 18px; }
+		h1 { margin:0 0 12px 0; color:#66d9ff; }
+		.controls { display:flex; gap:10px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+		select,input,button { padding:8px 10px; border-radius:6px; border: none; }
+		button { background:#3b82f6; color:white; cursor:pointer; }
+		#reset-zoom-btn { background:#526585 !important; }
+		
+		.chart-wrap { height:620px; background:#021025; padding:12px; border-radius:8px; }
+		#info { margin-top:10px; color:#9fb6d9; white-space:pre-line; }
+		/* Estilo para a área de informações copiável */
+		#copiable-info {	
+			background: #1e293b;	
+			padding: 15px;	
+			border-radius: 8px;	
+			border: 1px solid #334155;	
+			font-family: monospace;
+			white-space: pre-wrap;
+			cursor: text;
+		}
+		/* Estiliza o span copiável */
+		.copy-value {	
+			text-decoration: underline;
+			text-decoration-color: #66d9ff;
+			color: #fff;
+			cursor: copy;
+			font-weight: bold;
+		}
+	</style>
+</head>
+<body>
+	<h1>Crypto Signals — Regressão Linear no Browser (Vela Natural + Análise BB & Stoch)</h1>
+
+	<div class="controls">
+		<label>Moeda:
+			<select id="symbol-select" style="min-width:260px"></select>
+		</label>
+
+		<label>Timeframe:
+			<select id="timeframe-select">
+				<option value="1m">1m</option>
+				<option value="5m">5m</option>
+				<option value="15m">15m</option>
+				<option value="1h" selected>1h</option>
+				<option value="2h">2h</option>
+				<option value="4h">4h</option>
+				<option value="6h">6h</option>
+				<option value="12h">12h</option>
+				<option value="1d">1d</option>
+				<option value="1w">1w</option>
+				<option value="1M">1M</option>
+			</select>
+		</label>
+
+		<label>Lookback (features):
+			<input id="lookback" type="number" value="6" min="2" max="60" style="width:70px"/>
+		</label>
+
+		<span id="horizon-display" style="color:#66d9ff;">Horizonte: 12 candles</span>
+
+		<button id="load-btn">Carregar & Treinar</button>
+        <button id="reset-zoom-btn">Reset Zoom</button>
+        
+		<div id="status" style="margin-left:8px;color:#9fb6d9"></div>
+	</div>
+
+	<div class="chart-wrap">
+		<canvas id="price-chart"></canvas>
+	</div>
+
+	<div id="info">
+		<div id="copiable-info"></div>
+		<div id="model-notes"></div>
+	</div>
+
+<script>
+// Variáveis Globais
+const HORIZON_BASE_DAYS = 0.5; 
+const MAX_CANDLES_TO_FETCH = 1500; 
+const BB_PERIOD = 20;
+
+// ---------- FUNÇÃO DE COPIA DE TEXTO ----------
+function copyToClipboard(text, element) {
+	if (!navigator.clipboard) {
+		showStatus('A cópia para a área de transferência não é suportada neste navegador.');
+		return;
+	}
+	navigator.clipboard.writeText(text).then(() => {
+		showStatus(`Copiado: ${text} ✔`);
+		
+		const originalText = element.textContent;
+		element.textContent = 'COPIADO!';
+		element.style.color = '#10b981';
+		
+		setTimeout(() => {
+			element.textContent = originalText;
+			element.style.color = '';	
+		}, 500);
+		
+	}).catch(err => {
+		showStatus('Erro ao tentar copiar: ' + err);
+		console.error('Erro ao copiar texto: ', err);
+	});
+}
+// ---------------------------------------------
+
+// ---------- Indicadores/Util ----------
+function sma(arr, period) {
+	if (!arr || arr.length < period) return null;
+    let s=0; 
+    const start = arr.length - period;
+    for (let i=start;i<arr.length;i++) s+=arr[i]; 
+    return s/period;
+}
+
+function stdDev(arr, period) {
+	if (!arr || arr.length < period) return 0;
+	const values = arr.slice(arr.length - period);
+	const mean = values.reduce((a, b) => a + b, 0) / period;
+	const variance = values.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b, 0) / period;
+	return Math.sqrt(variance);
+}
+
+function bollingerBands(ohlc, period = 20, multiplier = 2) {
+	const closes = ohlc.map(d => d.c);
+	const bands = { middle: [], upper: [], lower: [] };
+
+	for (let i = 0; i < ohlc.length; i++) {
+		if (i < period - 1) {
+			bands.middle.push(null);
+			bands.upper.push(null);
+			bands.lower.push(null);
+			continue;
+		}
+
+        const sliceStart = i - period + 1;
+		const slice = closes.slice(sliceStart, i + 1);
+        
+		const sd = stdDev(closes.slice(0, i + 1), period);
+		const mean = slice.reduce((a, b) => a + b, 0) / period;
+
+		const time = ohlc[i].x;
+
+		bands.middle.push({ x: time, y: mean, sd: sd });
+		bands.upper.push({ x: time, y: mean + (sd * multiplier) });
+		bands.lower.push({ x: time, y: mean - (sd * multiplier) });
+	}
+	return bands;
+}
+
+/**
+ * Calcula a média de reversão em X períodos após tocar a banda.
+ */
+function calculateHistoricalReversionForce(ohlc, bbHistorical, reversionPeriods = 3) {
+    let totalUpReturn = 0;
+    let totalDownReturn = 0;
+    let countUp = 0;
+    let countDown = 0;
+    
+    // VERIFICAÇÃO DE SEGURANÇA
+    if (!bbHistorical.upper || bbHistorical.upper.length < BB_PERIOD + reversionPeriods) {
+        return { reversionUp: 0, reversionDown: 0 };
+    }
+
+    const closes = ohlc.map(d => d.c);
+    const period = BB_PERIOD; 
+    const ohlcLength = ohlc.length;
+
+    for (let i = period; i < ohlcLength - reversionPeriods; i++) {
+        const lowerBand = bbHistorical.lower[i]?.y;
+        const upperBand = bbHistorical.upper[i]?.y;
+        const close = closes[i];
+        
+        if (!lowerBand || !upperBand) continue;
+
+        const returnXPeriods = (closes[i + reversionPeriods] / close) - 1;
+
+        if (close <= lowerBand) {
+            totalUpReturn += returnXPeriods;
+            countUp++;
+        }
+        
+        if (close >= upperBand) {
+            totalDownReturn += returnXPeriods;
+            countDown++;
+        }
+    }
+
+    return {
+        reversionUp: countUp > 0 ? totalUpReturn / countUp : 0,
+        reversionDown: countDown > 0 ? totalDownReturn / countDown : 0
+    };
+}
+
+/**
+ * Analisa a largura da banda e o rompimento recente.
+ */
+function analyzeBBPath(bbHistorical, ohlc) {
+    const period = BB_PERIOD;
+    
+    // CORREÇÃO: Verifica se os dados da BB Historical existem e se têm comprimento suficiente.
+    if (!bbHistorical.upper || !bbHistorical.lower || bbHistorical.upper.length < period) {
+        // Se não houver dados suficientes, retorna o estado neutro imediatamente.
+        return { marketPhase: 'NORMAL', trendImpulse: 0 }; 
+    }
+    
+    const historyLen = bbHistorical.upper.length; 
+    
+    const lastUpper = bbHistorical.upper[historyLen - 1]?.y;
+    const lastLower = bbHistorical.lower[historyLen - 1]?.y;
+    const lastClose = ohlc[ohlc.length - 1].c;
+    const lastMiddle = bbHistorical.middle[historyLen - 1]?.y;
+    
+    // Verificação de segurança adicional para os últimos valores
+    if (!lastUpper || !lastLower || !lastMiddle) return { marketPhase: 'NORMAL', trendImpulse: 0 };
+    
+    const bandwidth = (lastUpper - lastLower) / lastMiddle;
+    
+    let bandwidthHistory = [];
+    const lookback = 10;
+    // Garante que o loop comece em um índice válido
+    const startIdx = Math.max(period, historyLen - lookback);
+
+    for (let i = startIdx; i < historyLen; i++) {
+        const up = bbHistorical.upper[i]?.y;
+        const low = bbHistorical.lower[i]?.y;
+        const mid = bbHistorical.middle[i]?.y;
+        if (up && low && mid) {
+            bandwidthHistory.push((up - low) / mid);
+        }
+    }
+    
+    if(bandwidthHistory.length === 0) return { marketPhase: 'NORMAL', trendImpulse: 0 };
+
+    const avgBandwidth = bandwidthHistory.reduce((a, b) => a + b, 0) / bandwidthHistory.length;
+
+    let marketPhase = 'NORMAL';
+    if (bandwidth < avgBandwidth * 0.8) {
+        marketPhase = 'SQUEEZE';
+    } else if (bandwidth > avgBandwidth * 1.2) {
+        marketPhase = 'EXPANSION';
+    }
+
+    let trendImpulse = 0; 
+    if (marketPhase === 'SQUEEZE') {
+        if (lastClose > lastUpper) {
+            trendImpulse = 0.005; 
+        } 
+        else if (lastClose < lastLower) {
+            trendImpulse = -0.005; 
+        }
+    }
+    
+    return { marketPhase, trendImpulse };
+}
+
+
+function rsi(arr, period=14) {
+	if (!arr || arr.length <= period) return 50;
+	let gains=0, losses=0;
+    const start = arr.length - period;
+	for (let i=start; i< arr.length; i++){
+		const d = arr[i] - arr[i-1];
+		if (d>0) gains += d; else losses += -d;
+	}
+	const avgG = gains/period;
+	const avgL = losses/period || 1e-9;
+	const rs = avgG/avgL;
+	return 100 - (100/(1+rs));
+}
+
+/**
+ * Calcula o Stochastic Oscillator (%K e %D)
+ */
+function stochastic(ohlc, kPeriod = 14, dPeriod = 3) {
+    const stochData = [];
+    const closes = ohlc.map(d => d.c);
+
+    for (let i = 0; i < ohlc.length; i++) {
+        const time = ohlc[i].x;
+
+        if (i < kPeriod - 1) {
+            stochData.push({ x: time, k: null, d: null });
+            continue;
+        }
+
+        const slice = ohlc.slice(i - kPeriod + 1, i + 1);
+        const highestHigh = Math.max(...slice.map(c => c.h));
+        const lowestLow = Math.min(...slice.map(c => c.l));
+        const currentClose = ohlc[i].c;
+        
+        // %K = 100 * ((Close - Lowest Low) / (Highest High - Lowest Low))
+        const kValue = (highestHigh === lowestLow) ? 50 : 
+                        100 * (currentClose - lowestLow) / (highestHigh - lowestLow);
+
+        stochData.push({ x: time, k: kValue, d: null });
+    }
+
+    // Calcula %D (SMA de %K)
+    for (let i = kPeriod - 1 + dPeriod - 1; i < stochData.length; i++) {
+        const kSlice = stochData.slice(i - dPeriod + 1, i + 1).map(d => d.k);
+        const dValue = kSlice.reduce((a, b) => a + b, 0) / dPeriod;
+        stochData[i].d = dValue;
+    }
+
+    // Preenche os %D anteriores com null (para manter o array alinhado)
+    for (let i = kPeriod - 1; i < kPeriod - 1 + dPeriod - 1; i++) {
+        stochData[i].d = null;
+    }
+
+    return stochData;
+}
+
+
+/**
+ * Calcula o Average True Range (ATR)
+ */
+function atr(ohlc, period=14) {
+	if (!ohlc || ohlc.length < 2) return null;
+    const trs = [];
+    for (let i = 1; i < ohlc.length; i++) {
+        const c = ohlc[i];	
+        const prevC = ohlc[i-1];	
+        // True Range: Max(H-L, |H-PrevClose|, |L-PrevClose|)
+        const tr = Math.max(c.h - c.l, Math.abs(c.h - prevC.c), Math.abs(c.l - prevC.c));
+        trs.push(tr);
+    }
+    
+    if (trs.length === 0) return 0;
+    
+    const startIdx = Math.max(0, trs.length - period);
+    const relevantTRs = trs.slice(startIdx);
+    return relevantTRs.reduce((a,b)=>a+b,0) / relevantTRs.length;
+}
+
+function intervalToMs(interval) {
+	const num = parseInt(interval);
+	const unit = interval.replace(num, '');
+	const msInSecond = 1000;
+	const msInMinute = 60 * msInSecond;
+	const msInHour = 60 * msInMinute;
+	const msInDay = 24 * msInHour;
+	
+	if (unit === 'm') return num * msInMinute;
+	if (unit === 'h') return num * msInHour;
+	if (unit === 'd') return num * msInDay;
+	if (unit === 'w') return num * 7 * msInDay;
+	if (unit === 'M') return num * 30 * msInDay; 
+	return msInHour;
+}
+
+function calculateHorizon(interval) {
+	const totalMs = HORIZON_BASE_DAYS * 24 * 60 * 60 * 1000; // 12 horas
+	const candleMs = intervalToMs(interval);
+	let horizon = Math.round(totalMs / candleMs);
+	horizon = Math.max(2, Math.min(60, horizon)); 
+	return horizon;
+}
+
+// ---------- ML: linear regression por gradient descent ----------
+/**
+ * NOVO PARÂMETRO: stochData
+ */
+function buildFeatureVector(ohlc, idx, lookback, btcCloses, stochData) {
+	const closes = ohlc.map(d=>d.c);
+	const features = [];
+	
+	// 1. Historial Returns
+	for (let k=lookback; k>=1; k--) {
+		const c_now = closes[idx - (k-1)];
+		const c_prev = closes[idx - k];
+		const r = (c_now / (c_prev || c_now)) - 1; 
+		features.push(r);
+	}
+	
+	// 2. Technical Indicators
+	const currentDataSlice = ohlc.slice(0, idx + 1);
+	const lastClose = closes[idx];
+    
+	// SMA
+	const smaVal = sma(closes.slice(0, idx+1), Math.min(9, idx+1)) || lastClose;	
+	features.push((smaVal/lastClose)-1); 
+	
+	// RSI
+	const rsiVal = rsi(closes.slice(0, idx+1), 14);
+	features.push((rsiVal - 50)/50); 
+	
+	// ATR
+	const atrVal = atr(currentDataSlice, 14) || 0;
+	features.push(atrVal / (lastClose || 1));
+	
+	// NOVO: Stochastic %K (Normalizado entre -1 e 1)
+	const kValue = stochData[idx]?.k;
+    if (kValue !== null && kValue !== undefined) {
+        // Normaliza 0-100 para -1 a 1 (0 -> -1, 100 -> 1)
+        features.push((kValue - 50) / 50); 
+    } else {
+        features.push(0); // Valor neutro se não puder ser calculado
+    }
+	
+	// 3. BTC Trend Feature	
+	if (btcCloses) {
+		const btc_c_now = btcCloses[idx];
+		const btc_c_prev = btcCloses[idx-1] || btc_c_now;
+		const btc_r = (btc_c_now / btc_c_prev) - 1;
+		features.push(btc_r);
+	}
+	
+	return features;
+}
+
+/**
+ * NOVO PARÂMETRO: stochData
+ */
+function prepareDataset(ohlc, lookback, btcOhlc, stochData) {
+	const closes = ohlc.map(d=>d.c);
+	const btcCloses = btcOhlc ? btcOhlc.map(d=>d.c) : null;
+	
+	const X = [], Y = [];
+	const limit = Math.min(ohlc.length, btcCloses ? btcCloses.length : ohlc.length) - 1;
+	
+	// O warm-up deve ser o maior valor necessário para calcular os features + o candle de predição (1)
+	// Stoch K=14, D=3 requer 14 + 3 - 1 = 16. O min é 50.
+	const warmupPeriod = Math.max(50, lookback + 15); 
+	if (ohlc.length < warmupPeriod || (btcOhlc && btcOhlc.length < warmupPeriod)) {
+        throw new Error(`Dados insuficientes (precisa de pelo menos ${warmupPeriod} candles).`);
+    }
+
+	for (let idx = warmupPeriod; idx < limit; idx++) {
+		// Passa stochData para a função de feature
+		const f = buildFeatureVector(ohlc, idx, lookback, btcCloses, stochData); 
+		const nextRet = (closes[idx+1] / closes[idx]) - 1;
+		
+		X.push([1, ...f]); // prepend bias 1
+		Y.push(nextRet);
+	}
+	return { X, Y };
+}
+
+async function trainLinearGD(X, Y, opts={lr:0.01, epochs:1000}) {
+	const m = X.length, n = X[0].length;
+	let w = new Array(n).fill(0);
+	const lr = opts.lr || 0.01;
+	const epochs = opts.epochs || 1000;
+
+	for (let ep=0; ep<epochs; ep++) {
+		const preds = X.map(row => row.reduce((s, val, i) => s + val * w[i], 0));
+		const residuals = preds.map((p,i)=> p - Y[i]);
+		const grad = new Array(n).fill(0);
+		for (let j=0;j<n;j++){
+			let s=0;
+			for (let i=0;i<m;i++) s += X[i][j] * residuals[i];
+			grad[j] = (2/m) * s;
+		}
+		for (let j=0;j<n;j++) w[j] -= lr * grad[j];
+		if (ep % 100 === 0) await new Promise(r=>setTimeout(r,0)); 
+	}
+	const preds = X.map(row => row.reduce((s, val, i) => s + val * w[i], 0));
+	const res = preds.map((p,i)=> p - Y[i]);
+	const mse = res.reduce((a,b)=>a + b*b, 0) / res.length;
+	const std = Math.sqrt(mse);
+	return { w, std };
+}
+
+function predictReturnOneStep(w, feat) {
+	let sum = w[0];
+	for (let i=0;i<feat.length;i++) sum += feat[i] * w[i+1];
+	return sum;
+}
+
+function gaussianRandom() {
+	let u = 0, v = 0;
+	while(u === 0) u = Math.random();
+	while(v === 0) v = Math.random();
+	return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+/**
+ * Funçao COMPLETA de Simulação com Fatores de Correção (BB, Stoch)
+ * @param {Array<Object>} btcOhlc - Dados históricos do BTC.
+ */
+function simulateForecast(
+    ohlc, w, stdResidual, horizon, lookback, interval, 
+    means, stds, btcOhlc, stochHistorical, currentATR, 
+    bbHistorical, historicalReversion, bbPathAnalysis
+) {
+    const closes = ohlc.map(d => d.c);
+    // *** CORREÇÃO: Usando 'btcOhlc' em vez de 'bhlc' ***
+    const btcCloses = btcOhlc.map(d => d.c);
+    let currentClose = closes[closes.length - 1];
+    let currentBTC = btcCloses[btcCloses.length - 1];
+    let currentTimestamp = ohlc[ohlc.length - 1].x;
+    const intervalMs = intervalToMs(interval);
+    
+    const preds = [];
+    const middle = [];
+    const upper = [];
+    const lower = [];
+    
+    // Inicia a simulação da Bollinger Band
+    const initialMiddle = bbHistorical.middle[bbHistorical.middle.length - 1]?.y || currentClose;
+    const initialStdDev = bbHistorical.middle[bbHistorical.middle.length - 1]?.sd || currentATR / 2;
+    const simulatedBands = [{ 
+        x: currentTimestamp, 
+        y: initialMiddle, 
+        sd: initialStdDev,
+        upper: initialMiddle + (initialStdDev * 2),
+        lower: initialMiddle - (initialStdDev * 2)
+    }]; 
+
+    // O primeiro retorno previsto (para o sinal)
+    const currentFeatRaw = buildFeatureVector(ohlc, ohlc.length - 1, lookback, btcCloses, stochHistorical);
+    const currentFeatNormalized = currentFeatRaw.map((val, j) => (val - means[j+1]) / stds[j+1]);
+    const expectedReturn = predictReturnOneStep(w, currentFeatNormalized);
+    const expectedReturnPct = expectedReturn * 100; 
+    
+    // Dados temporários para o cálculo de indicadores em tempo real (simulado)
+    let dynamicOHLC = [...ohlc];
+    let dynamicStoch = [...stochHistorical];
+    let dynamicBTCCloses = [...btcCloses];
+
+    for (let i = 1; i <= horizon; i++) {
+        currentTimestamp += intervalMs;
+        
+        // 1. Cria o vetor de features para o próximo passo (idx é o último candle antes do próximo)
+        const featIdx = dynamicOHLC.length - 1; 
+        const nextFeatRaw = buildFeatureVector(dynamicOHLC, featIdx, lookback, dynamicBTCCloses, dynamicStoch);
+
+        // 2. Normaliza
+        const nextFeatNormalized = nextFeatRaw.map((val, j) => (val - means[j+1]) / stds[j+1]);
+
+        // 3. Previsão de Retorno (Base Model)
+        let predictedReturn = predictReturnOneStep(w, nextFeatNormalized);
+        
+        // --- 4. Fatores de Correção/Simulação de Reversão ---
+        const currentSimBand = simulatedBands[simulatedBands.length - 1];
+        const distToMiddle = (currentClose / currentSimBand.y) - 1;
+        
+        let reversionFactor = distToMiddle * -0.5; // Empurra de volta para a média
+        
+        // Se o preço estiver fora das bandas, adiciona a força histórica de reversão
+        if (currentClose > currentSimBand.upper) {
+            reversionFactor += historicalReversion.reversionDown; 
+        } else if (currentClose < currentSimBand.lower) {
+            reversionFactor += historicalReversion.reversionUp;
+        }
+
+        // Adiciona impulso se estiver em SQUEEZE/BREAKOUT
+        reversionFactor += bbPathAnalysis.trendImpulse;
+        
+        predictedReturn += reversionFactor;
+
+        // --- 5. Adiciona Ruído (Volatilidade) ---
+        // Adiciona um ruído gaussiano baseado no desvio padrão residual do modelo
+        predictedReturn += gaussianRandom() * stdResidual; 
+
+        // 6. Calcula o Fechamento
+        const newClose = currentClose * (1 + predictedReturn);
+        
+        // 7. Simula a Volatilidade (Cálculo de H/L/O)
+        const simulatedVolumeFactor = 1 + gaussianRandom() * 0.3; 
+        const rangeBase = currentATR * simulatedVolumeFactor;
+        const range = Math.min(rangeBase, currentATR * 2.0);
+
+        const open = currentClose; 
+        const maxMovement = range * (0.5 + Math.abs(gaussianRandom() * 0.2)); 
+        
+        const high = newClose + maxMovement * Math.random();
+        const low = newClose - maxMovement * Math.random();
+
+        const finalHigh = Math.max(high, low, newClose, open);
+        const finalLow = Math.min(high, low, newClose, open);
+        
+        const nextCandle = { x: currentTimestamp, o: open, h: finalHigh, l: finalLow, c: newClose };
+        preds.push(nextCandle);
+        
+        // 8. Atualiza os arrays dinâmicos para o próximo loop
+        dynamicOHLC.push(nextCandle);
+        dynamicBTCCloses.push(currentBTC * (1 + (Math.random() * 0.005 - 0.0025))); // Simula BTC aleatório
+        // Recalcula Stochastic, mas só precisamos do último valor
+        const nextStoch = stochastic(dynamicOHLC);
+        dynamicStoch.push(nextStoch[nextStoch.length-1]);
+        
+        // 9. Simula a Próxima Bollinger Band
+        const simulatedCloses = dynamicOHLC.map(d => d.c).slice(-BB_PERIOD);
+        const simulatedMiddle = sma(simulatedCloses, BB_PERIOD) || newClose;
+        const simulatedSD = stdDev(simulatedCloses, BB_PERIOD);
+        
+        simulatedBands.push({
+            x: currentTimestamp,
+            y: simulatedMiddle,
+            sd: simulatedSD,
+            upper: simulatedMiddle + (simulatedSD * 2),
+            lower: simulatedMiddle - (simulatedSD * 2)
+        });
+
+        // 10. Atualiza para a próxima iteração
+        currentClose = newClose;
+        
+        // Adiciona aos arrays de BB do forecast
+        middle.push({ x: currentTimestamp, y: simulatedMiddle });
+        upper.push({ x: currentTimestamp, y: simulatedMiddle + (simulatedSD * 2) });
+        lower.push({ x: currentTimestamp, y: simulatedMiddle - (simulatedSD * 2) });
+    }
+
+    return { 
+        preds, 
+        middle, 
+        upper, 
+        lower, 
+        entry: ohlc[ohlc.length - 1].c,
+        expectedReturnPct 
+    };
+}
+
+
+// ---------- Binance/CoinGecko helpers ----------
+async function getTopCoins() {
+	const url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=500&page=1";
+	const r = await fetch(url);
+	if (!r.ok) throw new Error('CoinGecko failed');
+	return r.json();
+}
+async function getCandles(symbol, interval, limit=MAX_CANDLES_TO_FETCH) {
+	// A API da Binance exige que o parâmetro 'symbol' termine em 'USDT' para a maioria dos pares.
+    const fullSymbol = symbol.toUpperCase().endsWith('USDT') ? symbol.toUpperCase() : symbol.toUpperCase() + 'USDT';
+	const url = `https://api.binance.com/api/v3/klines?symbol=${fullSymbol}&interval=${interval}&limit=${limit}`;
+	const r = await fetch(url);
+	if (!r.ok) {
+		const txt = await r.text();
+		throw new Error(`Binance error ${r.status}: ${txt}. Tente rodar o arquivo usando um Live Server para evitar o erro de CORS.`);
+	}
+	const data = await r.json();
+    if (data.length === 0) throw new Error(`Não foi possível carregar candles para ${fullSymbol}. Dados vazios.`);
+    
+    // Filtra e mapeia, removendo candles incompletos/inválidos se for o caso
+	const mappedData = data.map(c => ({ x: +c[0], o:+c[1], h:+c[2], l:+c[3], c:+c[4] }));
+    
+    // Verifica se os candles têm timestamp e preço de fechamento válidos
+    const validData = mappedData.filter(c => c.x && c.c > 0 && c.h >= c.l);
+    
+    if (validData.length < 50) { // Um mínimo de 50 para fins de treino/indicadores
+        throw new Error(`Apenas ${validData.length} candles válidos encontrados para ${fullSymbol}. Dados insuficientes.`);
+    }
+    
+    return validData;
+}
+
+// ---------- UI + chart ----------
+let mainChart = null;
+
+const initialSymbols = [
+	'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT',
+	'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
+    'WIFUSDT', 'PIXELUSDT', 'POPCATUSDT' 
+];
+
+function showStatus(msg){	
+	const statusElement = document.getElementById('status');
+	if (statusElement) {
+		statusElement.textContent = msg;
+	}
+}
+
+function getSignalReason(expectedReturnPct, signalType, longTermTrend, bbPhase, stochK) {
+	const lastBtcRet = window.lastBtcReturnForReason || 0;	
+	let baseReason = '';
+	
+	if (signalType === 'BUY') {
+		baseReason = `O modelo prevê um retorno positivo de ${expectedReturnPct.toFixed(3)}% no horizonte.`;
+	} else if (signalType === 'SELL') {
+		baseReason = `O modelo prevê um retorno negativo de ${expectedReturnPct.toFixed(3)}% no horizonte, sugerindo uma tendência de baixa.`;
+	} else {
+		baseReason = `O retorno previsto é muito pequeno (${expectedReturnPct.toFixed(3)}%), indicando que o preço provavelmente se manterá lateralizado ou dentro da margem de erro.`;
+	}
+	
+	let btcComment = '';
+	if (Math.abs(lastBtcRet) > 0.0005) {
+		btcComment = ` A previsão incorpora a tendência recente do BTC (${(lastBtcRet*100).toFixed(3)}%), que influencia o par.`;
+	} else {
+		btcComment = ' O sinal é baseado principalmente na dinâmica interna do par e indicadores técnicos.';
+	}
+
+    const trendComment = ` A moeda está em uma **tendência de ${longTermTrend}** (SMA 50).`;
+    const bbComment = ` O mercado se encontra em fase de **${bbPhase}** de volatilidade (BB).`;
+    
+    let stochComment = '';
+    if (stochK >= 80) {
+        stochComment = ` O Estocástico K (${stochK.toFixed(1)}) está em **sobrecompra**, favorecendo uma reversão de baixa.`;
+    } else if (stochK <= 20) {
+        stochComment = ` O Estocástico K (${stochK.toFixed(1)}) está em **sobrevenda**, favorecendo uma reversão de alta.`;
+    } else {
+        stochComment = ` O Estocástico K (${stochK.toFixed(1)}) está na zona neutra.`;
+    }
+	
+	return baseReason + btcComment + trendComment + bbComment + stochComment;
+}
+
+function showInfo(signalData, modelData) {
+	const { symbol, signalType, expectedReturnPct, entry, targetPrice, stopPrice, horizon, longTermTrend, bbPhase, stochK } = signalData;	
+	const { std, lookback, X_length, w } = modelData; 
+
+	const action = signalType === 'BUY' ? 'COMPRA' : (signalType === 'SELL' ? 'VENDA' : 'MANTER (HOLD)');
+	const entryLabel = signalType === 'BUY' ? 'Entry (Preço de Compra)' : (signalType === 'SELL' ? 'Entry (Preço de Venda)' : 'Entry (Preço Atual)');
+	
+	const getCopyableSpan = (value, rawValue) => {
+		const textToCopy = typeof rawValue === 'number' ? rawValue.toFixed(6) : rawValue;
+		return `<span class="copy-value" onclick="copyToClipboard('${textToCopy}', this)">${value}</span>`;
+	};
+
+	const infoText = `
+[ ${action} ] - Par: ${getCopyableSpan(symbol, symbol)}
+------------------------------------------------
+${entryLabel}: ${getCopyableSpan(entry.toFixed(6), entry)}
+Target (Take Profit): ${getCopyableSpan(targetPrice.toFixed(6), targetPrice)}
+Stop Loss: ${getCopyableSpan(stopPrice.toFixed(6), stopPrice)}
+Retorno Esperado: <span style="color:${expectedReturnPct > 0 ? '#10b981' : (expectedReturnPct < 0 ? '#ef4444' : '#9fb6d9')}">${expectedReturnPct.toFixed(3)}%</span>
+------------------------------------------------
+Razão do Sinal: ${getSignalReason(expectedReturnPct, signalType, longTermTrend, bbPhase, stochK)}
+`;
+
+	const notesText = `
+Model residual std (pct): ${std.toFixed(6)}
+Horizon (candles): ${horizon}
+Lookback (features de retornos): ${lookback}
+Training rows: ${X_length}
+Weights (w): [${w.map(v=>v.toFixed(6)).join(', ')}]
+
+Notes:
+- Simulação de Forecast incorpora análise de Regressão (incluindo Stoch %K), Bollinger Bands (Reversão e Expansão/Contração) e Momentum.
+- Stop Loss/Take Profit calculados usando ATR (Average True Range).
+`;
+
+	document.getElementById('copiable-info').innerHTML = infoText;
+	document.getElementById('model-notes').textContent = notesText;
+	document.getElementById('horizon-display').textContent = `Horizonte: ${horizon} candles`;
+}
+
+// ----------------------------------------------------------------------
+// *** FUNÇÃO initChart (Com Zoom e Pan em X e Y) ***
+// ----------------------------------------------------------------------
+function initChart(ohlc, forecastData, bbHistorical, forecastBB) {
+	const ctx = document.getElementById('price-chart').getContext('2d');
+	
+	const allData = ohlc.concat(forecastData);
+	const filteredBBMiddle = bbHistorical.middle.filter(d => d !== null && d.y !== null);
+	const filteredBBUpper = bbHistorical.upper.filter(d => d !== null && d.y !== null);
+	const filteredBBLower = bbHistorical.lower.filter(d => d !== null && d.y !== null);
+
+	const allBBMiddle = filteredBBMiddle.concat(forecastBB.middle);
+	const allBBUpper = filteredBBUpper.concat(forecastBB.upper);
+	const allBBLower = filteredBBLower.concat(forecastBB.lower);
+
+	const historicalCandles = ohlc.map((d,i) => ({ ...d, color: (d.c >= d.o ? '#10b981' : '#ef4444') }));
+	const forecastCandles = forecastData.map((d,i) => ({ ...d, color: (d.c >= d.o ? '#38bdf8' : '#f97316' ) }));
+
+	const datasets = [
+		{
+			label: 'Preço Histórico',
+			data: historicalCandles,
+			borderColor: '#66d9ff',
+			borderWidth: 1,
+			type: 'candlestick',
+			color: { up: '#10b981', down: '#ef4444', neutral: '#94a3b8' }
+		},
+		{
+			label: 'Previsão',
+			data: forecastCandles,
+			borderColor: '#66d9ff',
+			borderWidth: 1,
+			type: 'candlestick',
+			color: { up: '#38bdf8', down: '#f97316', neutral: '#94a3b8' },
+			borderDash: [5, 5]
+		},
+		{
+			label: 'BB Middle (20)',
+			data: allBBMiddle,
+			type: 'line',
+			pointRadius: 0,
+			borderColor: '#94a3b8',
+			borderWidth: 1.5
+		},
+		{
+			label: 'BB Upper',
+			data: allBBUpper,
+			type: 'line',
+			pointRadius: 0,
+			borderColor: '#facc15', 
+			borderWidth: 1
+		},
+		{
+			label: 'BB Lower',
+			data: allBBLower,
+			type: 'line',
+			pointRadius: 0,
+			borderColor: '#ef4444', 
+			borderWidth: 1
+		}
+	];
+
+	// CALCULA LIMITES PARA O ZOOM INICIAL (Escala X)
+    const viewLimit = 150; 
+    const startIndex = Math.max(0, ohlc.length - viewLimit);
+    const minTime = ohlc[startIndex].x; 
+    const maxTime = forecastData.length > 0 ? forecastData[forecastData.length - 1].x : ohlc[ohlc.length - 1].x; 
+
+    // --- CÁLCULO PARA O ZOOM Y INICIAL ---
+    const lastClose = ohlc[ohlc.length - 1].c;
+    const atrValue = atr(ohlc, 14); 
+    const buffer = atrValue * 3; 
+
+    const minBuffer = lastClose * 0.01;
+    const finalBuffer = Math.max(buffer, minBuffer);
+
+    const yMinInitial = lastClose - finalBuffer;
+    const yMaxInitial = lastClose + finalBuffer;
+    // ------------------------------------
+
+
+	if (mainChart) mainChart.destroy();
+
+	mainChart = new Chart(ctx, {
+		type: 'scatter',
+		data: { datasets: datasets },
+		options: {
+			responsive: true,
+			maintainAspectRatio: false,
+			interaction: {
+				mode: 'index',
+				intersect: false,
+			},
+			scales: {
+				x: {
+					type: 'time',
+					time: { unit: 'day' },
+					ticks: { color: '#e6f0ff' },
+					grid: { color: 'rgba(255,255,255,0.05)' },
+					
+                    // Mantemos min/max aqui para definir a VISUALIZAÇÃO inicial X (a janela de tempo)
+                    min: minTime, 
+                    max: maxTime, 
+				},
+				y: {
+                    // *** Importante: REMOVER min e max DA ESCALA Y para liberar o zoom/pan (esticar/encolher) ***
+					ticks: { color: '#e6f0ff' },
+					grid: { color: 'rgba(255,255,255,0.05)' }
+				}
+			},
+			plugins: {
+				title: { display: false },
+				legend: { display: true, position: 'top', labels: { color: '#e6f0ff' } },
+				zoom: {
+					// Define os limites máximos/mínimos (total) que o usuário pode alcançar
+                    limits: {
+                        y: {
+                            // Damos uma margem extra para o zoom in/out
+                            min: yMinInitial * 0.5, 
+                            max: yMaxInitial * 1.5,
+                        },
+                        x: {
+                            min: ohlc[0].x,
+                            max: forecastData.length > 0 ? forecastData[forecastData.length - 1].x : ohlc[ohlc.length - 1].x,
+                        }
+                    },
+					zoom: {
+						// Habilita o zoom (roda do mouse/pinch)
+						wheel: { enabled: true },
+						pinch: { enabled: true },
+						// *** CORREÇÃO: Define o modo para 'xy' para permitir zoom em X e Y (esticar/encolher) ***
+						mode: 'xy', 
+					},
+					pan: {
+						// Habilita o arrastar (pan)
+						enabled: true,
+						// *** CORREÇÃO: Define o modo para 'xy' para permitir arrastar em X e Y ***
+						mode: 'xy', 
+						threshold: 5,
+					}
+				},
+				annotation: {
+					annotations: {
+						entryLine: {
+							type: 'line',
+							yMin: forecastData.length > 0 ? forecastData[0].o : null, 
+							yMax: forecastData.length > 0 ? forecastData[0].o : null,
+							borderColor: '#66d9ff',
+							borderWidth: 1,
+							borderDash: [6, 6],
+							label: {
+								enabled: true,
+								content: 'Entry',
+								position: 'start',
+								backgroundColor: '#66d9ff'
+							}
+						}
+					}
+				}
+			}
+		}
+	});
+    
+    // *** CORREÇÃO: Chama resetZoom() para aplicar os limites iniciais definidos. ***
+    if (mainChart && mainChart.options.plugins.zoom) {
+		mainChart.resetZoom();
+	}
+}
+// ----------------------------------------------------------------------
+
+
+function updateChartAnnotations(signalData) {
+	if (!mainChart) return;
+	
+	const annotations = {
+		entryLine: {
+			type: 'line',
+			yMin: signalData.entry, 
+			yMax: signalData.entry,
+			borderColor: '#66d9ff',
+			borderWidth: 1,
+			borderDash: [6, 6],
+			label: {
+				enabled: true,
+				content: 'Entry',
+				position: 'start',
+				backgroundColor: '#66d9ff'
+			}
+		},
+		targetLine: {
+			type: 'line',
+			yMin: signalData.targetPrice, 
+			yMax: signalData.targetPrice,
+			borderColor: '#10b981',
+			borderWidth: 1.5,
+			label: {
+				enabled: true,
+				content: 'Take Profit',
+				position: 'end',
+				backgroundColor: '#10b981'
+			}
+		},
+		stopLine: {
+			type: 'line',
+			yMin: signalData.stopPrice, 
+			yMax: signalData.stopPrice,
+			borderColor: '#ef4444',
+			borderWidth: 1.5,
+			label: {
+				enabled: true,
+				content: 'Stop Loss',
+				position: 'end',
+				backgroundColor: '#ef4444'
+			}
+		}
+	};
+	
+	mainChart.options.plugins.annotation.annotations = annotations;
+	mainChart.update('none');
+}
+
+async function runPipeline(symbol, interval, lookback) {
+	try {
+		const horizon = calculateHorizon(interval); 
+
+		showStatus(`Baixando ${MAX_CANDLES_TO_FETCH} candles de ${symbol} e BTCUSDT...`);
+		
+        // Tenta carregar os dados
+		const ohlc = await getCandles(symbol, interval);	
+		const btcOhlc = await getCandles('BTCUSDT', interval);	
+
+		// Stoch K=14, D=3 requer 14 + 3 - 1 = 16 candles. O max de warmup é 50.
+		const warmupPeriod = Math.max(50, lookback + 15); 
+		if (ohlc.length < warmupPeriod || btcOhlc.length < warmupPeriod) {
+            throw new Error(`Dados insuficientes (precisa de pelo menos ${warmupPeriod} candles). Tente um Timeframe maior.`);
+        }
+
+		// Garante que os dois arrays estejam alinhados no tempo para que os índices do BTC correspondam aos do par.
+		const minLen = Math.min(ohlc.length, btcOhlc.length);
+		const alignedOhlc = ohlc.slice(ohlc.length - minLen);
+		const alignedBtcOhlc = btcOhlc.slice(btcOhlc.length - minLen);
+
+        // Verificação final dos dados alinhados
+        if (alignedOhlc.length < warmupPeriod || alignedBtcOhlc.length < warmupPeriod) {
+            throw new Error(`Dados alinhados insuficientes (apenas ${alignedOhlc.length} candles).`);
+        }
+		
+		const lastBtcClose = alignedBtcOhlc[alignedBtcOhlc.length-1].c;
+		const secondLastBtcClose = alignedBtcOhlc[alignedBtcOhlc.length-2].c;
+		window.lastBtcReturnForReason = (lastBtcClose / secondLastBtcClose) - 1;
+
+        // CALCULA INDICADORES HISTÓRICOS
+        const closes = alignedOhlc.map(d=>d.c);
+        const lastClose = closes[closes.length-1];
+        const sma50 = sma(closes, 50);
+        const longTermTrend = lastClose > sma50 ? 'ALTA' : (lastClose < sma50 ? 'BAIXA' : 'LATERALIZADA');
+        
+        const stochData = stochastic(alignedOhlc);
+        const currentStochK = stochData[stochData.length-1]?.k || 50;
+
+
+		showStatus(`Preparando dataset (Lookback: ${lookback}, Stoch incluído)...`);
+		// Passa o Stoch Data para o preparo do dataset
+		const { X, Y } = prepareDataset(alignedOhlc, lookback, alignedBtcOhlc, stochData);
+        // Armazena o tamanho do X antes da normalização (onde ele é usado)
+        const X_length = X.length; 
+
+		if (X_length < 50) {
+			showStatus('Dados insuficientes para treinar (precisa de mais de 50 linhas de treino. Tente um Timeframe maior).');
+			return;
+		}
+
+		showStatus('Treinando modelo (grad. descent)...');
+		// Normalização
+		const m = X.length, n = X[0].length;
+		const means = new Array(n).fill(0), stds = new Array(n).fill(0);
+		for (let j=1;j<n;j++){
+			let s=0; for (let i=0;i<m;i++) s += X[i][j];
+			means[j] = s/m;
+			let ss=0; for (let i=0;i<m;i++) ss += Math.pow(X[i][j]-means[j],2);
+			stds[j] = Math.sqrt(ss/m) || 1e-9; // Evita divisão por zero
+			for (let i=0;i<m;i++) X[i][j] = (X[i][j] - means[j]) / stds[j];
+		}
+		
+		const trainOpts = { lr: 0.01, epochs: 1000 };	
+		const { w, std } = await trainLinearGD(X, Y, trainOpts);
+
+		showStatus('Prevendo futuro...');
+		
+		const currentATR = atr(alignedOhlc, 14);
+		const bbHistorical = bollingerBands(alignedOhlc, BB_PERIOD, 2);
+        
+        // 1. Calcula a força de reversão histórica
+        const historicalReversion = calculateHistoricalReversionForce(alignedOhlc, bbHistorical, 3);
+        
+        // 2. Analisa o caminho da BB
+        const bbPathAnalysis = analyzeBBPath(bbHistorical, alignedOhlc); 
+		
+		// Simulação com o novo modelo - Passa stochData também
+		const forecastSim = simulateForecast(
+            alignedOhlc, w, std, horizon, lookback, interval, 
+            means, stds, alignedBtcOhlc, stochData, currentATR, 
+            bbHistorical, historicalReversion, bbPathAnalysis
+        );
+
+		// Stop/Target baseado no ATR (Regra simples de risco)
+		const entryPrice = forecastSim.entry;
+		
+		// Usamos 0.5 * desvio padrão do erro como threshold para considerar um sinal válido
+		const signalThreshold = std * 100 * 0.5; 
+		
+		const signalType = forecastSim.expectedReturnPct > signalThreshold ? 'BUY' : (forecastSim.expectedReturnPct < -signalThreshold ? 'SELL' : 'HOLD');
+		
+		let stopPrice, targetPrice;
+
+		const atrMultipleSL = 2.5; 
+		const atrMultipleTP = 3.5; 
+		
+		if (signalType === 'BUY') {
+			stopPrice = entryPrice - (currentATR * atrMultipleSL);
+			targetPrice = entryPrice + (currentATR * atrMultipleTP);
+		} else if (signalType === 'SELL') {
+			targetPrice = entryPrice - (currentATR * atrMultipleTP);
+			stopPrice = entryPrice + (currentATR * atrMultipleSL);
+		} else {
+			// Se HOLD, usamos os limites do forecast (que já são as BBs simuladas)
+			const lastUpper = forecastSim.upper[forecastSim.upper.length-1];
+			const lastLower = forecastSim.lower[forecastSim.lower.length-1];
+			
+			// Fallback para ATR se as bandas não forem calculadas
+			stopPrice = lastLower ? lastLower.y : entryPrice - currentATR;
+			targetPrice = lastUpper ? lastUpper.y : entryPrice + currentATR;
+		}
+		
+		stopPrice = Math.max(0.000001, stopPrice);
+		targetPrice = Math.max(0.000001, targetPrice);
+
+		// Plot
+		
+		// 1. DADOS BB HISTÓRICOS (apenas pontos válidos)
+		const filteredMiddle = bbHistorical.middle.filter(d => d !== null && d.y !== null);
+		const filteredUpper = bbHistorical.upper.filter(d => d !== null && d.y !== null);
+		const filteredLower = bbHistorical.lower.filter(d => d !== null && d.y !== null);
+
+		if (filteredMiddle.length === 0) {
+			showStatus('Erro: Dados insuficientes para calcular as Bandas de Bollinger.');
+			return;
+		}
+
+		// 2. DADOS BB DE FORECAST (os pontos gerados)
+		const forecastBB = {
+			middle: forecastSim.middle.filter(d => d !== null),
+			upper: forecastSim.upper.filter(d => d !== null),
+			lower: forecastSim.lower.filter(d => d !== null)
+		};
+		
+		// Inicializa o gráfico (agora com a correção do zoom)
+		initChart(alignedOhlc, forecastSim.preds, bbHistorical, forecastBB);
+		
+		const signalData = {
+			symbol: symbol,
+			signalType: signalType,
+			expectedReturnPct: forecastSim.expectedReturnPct,
+			entry: entryPrice,
+			targetPrice: targetPrice,
+			stopPrice: stopPrice,
+			horizon: horizon,
+			longTermTrend: longTermTrend,
+			bbPhase: bbPathAnalysis.marketPhase,
+			stochK: currentStochK
+		};
+
+		const modelData = {
+			std: std*100, // em percentual
+			lookback: lookback,
+			X_length: X_length,
+			w: w
+		};
+
+		showInfo(signalData, modelData);
+		updateChartAnnotations(signalData);
+
+		showStatus(`Pronto! Sinal de ${signalType} para ${symbol}.`);
+
+	} catch (error) {
+		console.error(error);
+		showStatus(`ERRO: ${error.message}`);
+	}
+}
+
+async function initialize() {
+	const symbolSelect = document.getElementById('symbol-select');
+	const loadBtn = document.getElementById('load-btn');
+	const resetZoomBtn = document.getElementById('reset-zoom-btn');
+	
+	// Preenche o seletor de símbolos com os pares iniciais
+	initialSymbols.forEach(symbol => {
+		const option = document.createElement('option');
+		option.value = symbol.replace('USDT', '');
+		option.textContent = symbol;
+		symbolSelect.appendChild(option);
+	});
+	
+	// Adiciona a opção BTCUSDT no início (se já não estiver lá)
+	if (!symbolSelect.querySelector('option[value="BTC"]')) {
+		const btcOption = document.createElement('option');
+		btcOption.value = 'BTC';
+		btcOption.textContent = 'BTCUSDT';
+		symbolSelect.prepend(btcOption);
+	}
+	symbolSelect.value = 'SOL'; // Define um padrão após o preenchimento
+
+	// Adiciona evento ao botão de carregamento
+	loadBtn.addEventListener('click', () => {
+		const symbol = symbolSelect.value;
+		const timeframe = document.getElementById('timeframe-select').value;
+		const lookback = parseInt(document.getElementById('lookback').value);
+		runPipeline(symbol, timeframe, lookback);
+	});
+	
+	// Adiciona evento ao botão de reset zoom
+	resetZoomBtn.addEventListener('click', () => {
+		if (mainChart && mainChart.options.plugins.zoom) {
+			// Usa o método do plugin para resetar para o estado inicial (o que aplica os limits)
+			mainChart.resetZoom(); 
+		}
+	});
+
+	// Tenta carregar os 500 principais e adicionar ao seletor (em segundo plano)
+	try {
+		const topCoins = await getTopCoins();
+		topCoins.slice(0, 500).forEach(coin => {
+			const symbol = coin.symbol.toUpperCase();
+			// Adiciona apenas se for um par USDT
+			if (!initialSymbols.includes(symbol + 'USDT')) {
+				const option = document.createElement('option');
+				option.value = symbol;
+				option.textContent = symbol + 'USDT';
+				symbolSelect.appendChild(option);
+			}
+		});
+		showStatus('Lista de moedas atualizada com sucesso!');
+	} catch (e) {
+		showStatus('Não foi possível carregar a lista de moedas do CoinGecko, usando a lista padrão.');
+	}
+
+	// Carrega o primeiro gráfico ao iniciar (SOL/1h)
+	runPipeline('SOL', '1h', 6);
+}
+
+document.addEventListener('DOMContentLoaded', initialize);
+
+</script>
+</body>
+</html>
