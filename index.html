@@ -10,10 +10,12 @@
 		h1 { margin:0 0 12px 0; color:#66d9ff; }
 		.controls { display:flex; gap:10px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
 		select,input,button { padding:8px 10px; border-radius:6px; border: none; }
-		button { background:#3b82f6; color:white; cursor:pointer; }
+		button { background:#3b82f6; color:white; cursor:pointer; transition: all 0.2s; }
+		button:hover { background:#2563eb; transform: translateY(-1px); }
 		#reset-zoom-btn { background:#526585 !important; }
+		#reset-zoom-btn:hover { background:#475569 !important; }
 		
-		.chart-wrap { height:620px; background:#021025; padding:12px; border-radius:8px; }
+		.chart-wrap { height:650px; background:#021025; padding:12px; border-radius:8px; }
 		#info { margin-top:10px; color:#9fb6d9; white-space:pre-line; }
 		/* Estilo para a área de informações copiável */
 		#copiable-info {	
@@ -72,7 +74,15 @@
 	</div>
 
 	<div class="chart-wrap">
-		<div id="lw-chart" style="width:100%;height:100%;min-height:600px;"></div>
+		<div id="lw-chart" style="width:100%;height:100%;min-height:630px;"></div>
+		<div style="display:flex; gap:15px; margin-top:8px; font-size:11px; color:#9fb6d9; flex-wrap:wrap;">
+			<span>🔵 <span style="color:#2196F3;">Entry</span></span>
+			<span>🔴 <span style="color:#f23645;">Stop Loss</span></span>
+			<span>🟢 <span style="color:#089981;">Take Profit</span></span>
+			<span>📊 <span style="color:#2962FF;">BB Middle (SMA 20)</span></span>
+			<span>⬜ <span style="color:#787B86;">BB Upper/Lower</span></span>
+			<span>🔷 <span style="color:#38bdf8;">Previsão (Forecast)</span></span>
+		</div>
 	</div>
 
 	<div id="info">
@@ -83,8 +93,8 @@
 <script>
 
 // Variáveis Globais
-const HORIZON_BASE_DAYS = 0.5; 
-const MAX_CANDLES_TO_FETCH = 1500; 
+const HORIZON_BASE_DAYS = 0.5;
+const MAX_CANDLES_TO_FETCH = 1500;
 const BB_PERIOD = 20;
 
 // LW Chart globals
@@ -93,9 +103,12 @@ let lwCandlestickSeries = null;
 let lwEntryLine = null;
 let lwStopLine = null;
 let lwTargetLine = null;
+let lwBBUpperSeries = null;
+let lwBBMiddleSeries = null;
+let lwBBLowerSeries = null;
 
 // Função para inicializar o gráfico Lightweight Charts
-function initChartLW(ohlc, forecastData, entry, stop, target) {
+function initChartLW(ohlc, forecastData, entry, stop, target, bbHistorical) {
 	// Remove gráfico anterior
 	if (lwChart) {
 		lwChart.remove();
@@ -104,41 +117,79 @@ function initChartLW(ohlc, forecastData, entry, stop, target) {
 		lwEntryLine = null;
 		lwStopLine = null;
 		lwTargetLine = null;
+		lwBBUpperSeries = null;
+		lwBBMiddleSeries = null;
+		lwBBLowerSeries = null;
 	}
 	const container = document.getElementById('lw-chart');
 	lwChart = LightweightCharts.createChart(container, {
 		layout: {
 			background: { color: '#021025' },
-			textColor: '#e6f0ff',
+			textColor: '#d1d4dc',
 		},
 		grid: {
-			vertLines: { color: 'rgba(255,255,255,0.05)' },
-			horzLines: { color: 'rgba(255,255,255,0.05)' },
+			vertLines: { color: 'rgba(197,203,206,0.1)' },
+			horzLines: { color: 'rgba(197,203,206,0.1)' },
 		},
 		width: container.offsetWidth,
 		height: container.offsetHeight,
 		timeScale: {
 			timeVisible: true,
 			secondsVisible: false,
-			borderColor: '#334155',
+			borderColor: '#2B2B43',
+			visible: true,
 		},
 		rightPriceScale: {
-			borderColor: '#334155',
+			borderColor: '#2B2B43',
+			visible: true,
+			scaleMargins: {
+				top: 0.1,
+				bottom: 0.1,
+			},
+			alignLabels: true,
+			borderVisible: true,
+			mode: LightweightCharts.PriceScaleMode.Normal,
 		},
 		crosshair: {
 			mode: LightweightCharts.CrosshairMode.Normal,
+			vertLine: {
+				width: 1,
+				color: '#758696',
+				style: LightweightCharts.LineStyle.Dashed,
+				labelBackgroundColor: '#4682B4',
+			},
+			horzLine: {
+				width: 1,
+				color: '#758696',
+				style: LightweightCharts.LineStyle.Dashed,
+				labelBackgroundColor: '#4682B4',
+			},
 		},
-		handleScroll: true,
-		handleScale: true,
+		handleScroll: {
+			mouseWheel: true,
+			pressedMouseMove: true,
+			touch: true,
+			vertTouchDrag: false,
+		},
+		handleScale: {
+			axisPressedMouseMove: {
+				time: true,
+				price: true,
+			},
+			mouseWheel: true,
+			pinch: true,
+		},
 	});
 
 	lwCandlestickSeries = lwChart.addCandlestickSeries({
-		upColor: '#10b981',
-		downColor: '#ef4444',
-		borderUpColor: '#10b981',
-		borderDownColor: '#ef4444',
-		wickUpColor: '#10b981',
-		wickDownColor: '#ef4444',
+		upColor: '#26a69a',
+		downColor: '#ef5350',
+		borderUpColor: '#26a69a',
+		borderDownColor: '#ef5350',
+		wickUpColor: '#26a69a',
+		wickDownColor: '#ef5350',
+		priceLineVisible: true,
+		lastValueVisible: true,
 	});
 
 	// Junta histórico e forecast
@@ -154,17 +205,87 @@ function initChartLW(ohlc, forecastData, entry, stop, target) {
 	}));
 	lwCandlestickSeries.setData(lwCandles);
 
-	// Linhas horizontais Entry/Stop/Target
+	// Configura marcador no último candle (preço atual)
+	const lastCandle = lwCandles[lwCandles.length - 1];
+	lwCandlestickSeries.setMarkers([{
+		time: lastCandle.time,
+		position: 'inBar',
+		color: '#2196F3',
+		shape: 'circle',
+		text: 'Atual',
+	}]);
+
+	// Bollinger Bands
+	if (bbHistorical && bbHistorical.middle && bbHistorical.middle.length > 0) {
+		const bbMiddleData = bbHistorical.middle
+			.filter(d => d && d.x && d.y)
+			.map(d => ({ time: Math.floor(d.x/1000), value: d.y }));
+		const bbUpperData = bbHistorical.upper
+			.filter(d => d && d.x && d.y)
+			.map(d => ({ time: Math.floor(d.x/1000), value: d.y }));
+		const bbLowerData = bbHistorical.lower
+			.filter(d => d && d.x && d.y)
+			.map(d => ({ time: Math.floor(d.x/1000), value: d.y }));
+
+		if (bbMiddleData.length > 0) {
+			lwBBMiddleSeries = lwChart.addLineSeries({
+				color: '#2962FF',
+				lineWidth: 1,
+				priceLineVisible: false,
+				lastValueVisible: false,
+			});
+			lwBBMiddleSeries.setData(bbMiddleData);
+		}
+
+		if (bbUpperData.length > 0) {
+			lwBBUpperSeries = lwChart.addLineSeries({
+				color: '#787B86',
+				lineWidth: 1,
+				priceLineVisible: false,
+				lastValueVisible: false,
+			});
+			lwBBUpperSeries.setData(bbUpperData);
+		}
+
+		if (bbLowerData.length > 0) {
+			lwBBLowerSeries = lwChart.addLineSeries({
+				color: '#787B86',
+				lineWidth: 1,
+				priceLineVisible: false,
+				lastValueVisible: false,
+			});
+			lwBBLowerSeries.setData(bbLowerData);
+		}
+	}
+
+	// Linhas horizontais Entry/Stop/Target com estilo TradingView
 	if (entry) {
-		lwEntryLine = lwChart.addLineSeries({ color: '#facc15', lineWidth: 2 });
+		lwEntryLine = lwChart.addLineSeries({
+			color: '#2196F3',
+			lineWidth: 2,
+			priceLineVisible: false,
+			lastValueVisible: false,
+		});
 		lwEntryLine.setData([{ time: lwCandles[0].time, value: entry }, { time: lwCandles[lwCandles.length-1].time, value: entry }]);
 	}
 	if (stop) {
-		lwStopLine = lwChart.addLineSeries({ color: '#ef4444', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed });
+		lwStopLine = lwChart.addLineSeries({
+			color: '#f23645',
+			lineWidth: 2,
+			lineStyle: LightweightCharts.LineStyle.Dashed,
+			priceLineVisible: false,
+			lastValueVisible: false,
+		});
 		lwStopLine.setData([{ time: lwCandles[0].time, value: stop }, { time: lwCandles[lwCandles.length-1].time, value: stop }]);
 	}
 	if (target) {
-		lwTargetLine = lwChart.addLineSeries({ color: '#10b981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed });
+		lwTargetLine = lwChart.addLineSeries({
+			color: '#089981',
+			lineWidth: 2,
+			lineStyle: LightweightCharts.LineStyle.Dashed,
+			priceLineVisible: false,
+			lastValueVisible: false,
+		});
 		lwTargetLine.setData([{ time: lwCandles[0].time, value: target }, { time: lwCandles[lwCandles.length-1].time, value: target }]);
 	}
 
@@ -792,7 +913,7 @@ function showInfo(signalData, modelData) {
 	const { symbol, signalType, expectedReturnPct, entry, targetPrice, stopPrice, horizon, longTermTrend, bbPhase, stochK } = signalData;	
 	const { std, lookback, X_length, w } = modelData; 
 
-	const action = signalType === 'BUY' ? 'COMPRA' : (signalType === 'SELL' ? 'VENDA' : 'MANTER (HOLD)');
+	const action = signalType === 'BUY' ? 'COMPRA 🟢' : (signalType === 'SELL' ? 'VENDA 🔴' : 'MANTER (HOLD) ⏸️');
 	const entryLabel = signalType === 'BUY' ? 'Entry (Preço de Compra)' : (signalType === 'SELL' ? 'Entry (Preço de Venda)' : 'Entry (Preço Atual)');
 	
 	const getCopyableSpan = (value, rawValue) => {
@@ -1136,8 +1257,8 @@ async function runPipeline(symbol, interval, lookback) {
 		// Stop/Target baseado no ATR (Regra simples de risco)
 		const entryPrice = forecastSim.entry;
 		
-		// Usamos 0.5 * desvio padrão do erro como threshold para considerar um sinal válido
-		const signalThreshold = std * 100 * 0.5; 
+		// Threshold sensível para capturar tendências (30% do desvio padrão)
+		const signalThreshold = std * 100 * 0.3; 
 		
 		const signalType = forecastSim.expectedReturnPct > signalThreshold ? 'BUY' : (forecastSim.expectedReturnPct < -signalThreshold ? 'SELL' : 'HOLD');
 		
@@ -1184,8 +1305,13 @@ async function runPipeline(symbol, interval, lookback) {
 			lower: forecastSim.lower.filter(d => d !== null)
 		};
 		
-		// Inicializa o gráfico (agora com a correção do zoom)
-	initChartLW(alignedOhlc, forecastSim.preds, entryPrice, stopPrice, targetPrice);
+		// Inicializa o gráfico (agora com a correção do zoom e Bollinger Bands)
+		const filteredBBHistorical = {
+			middle: bbHistorical.middle.filter(d => d !== null && d.y !== null),
+			upper: bbHistorical.upper.filter(d => d !== null && d.y !== null),
+			lower: bbHistorical.lower.filter(d => d !== null && d.y !== null)
+		};
+	initChartLW(alignedOhlc, forecastSim.preds, entryPrice, stopPrice, targetPrice, filteredBBHistorical);
 		
 		const signalData = {
 			symbol: symbol,
