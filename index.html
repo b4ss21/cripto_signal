@@ -3,15 +3,7 @@
 <head>
 	<meta charset="utf-8"/>
 	<title>Crypto Signals — Regressão Linear no Browser (Vela Natural + Análise BB & Stoch)</title>
-
-	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-	<script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
-	<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon"></script>
-	<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial"></script>
-	
-	<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
-	<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
-
+	<!-- Lightweight Charts -->
 
 	<style>
 		body { background:#071024; color:#e6f0ff; font-family: Inter, Arial; margin: 18px; }
@@ -80,7 +72,7 @@
 	</div>
 
 	<div class="chart-wrap">
-		<canvas id="price-chart"></canvas>
+		<div id="lw-chart" style="width:100%;height:100%;min-height:600px;"></div>
 	</div>
 
 	<div id="info">
@@ -89,10 +81,95 @@
 	</div>
 
 <script>
+
 // Variáveis Globais
 const HORIZON_BASE_DAYS = 0.5; 
 const MAX_CANDLES_TO_FETCH = 1500; 
 const BB_PERIOD = 20;
+
+// LW Chart globals
+let lwChart = null;
+let lwCandlestickSeries = null;
+let lwEntryLine = null;
+let lwStopLine = null;
+let lwTargetLine = null;
+
+// Função para inicializar o gráfico Lightweight Charts
+function initChartLW(ohlc, forecastData, entry, stop, target) {
+	// Remove gráfico anterior
+	if (lwChart) {
+		lwChart.remove();
+		lwChart = null;
+		lwCandlestickSeries = null;
+		lwEntryLine = null;
+		lwStopLine = null;
+		lwTargetLine = null;
+	}
+	const container = document.getElementById('lw-chart');
+	lwChart = LightweightCharts.createChart(container, {
+		layout: {
+			background: { color: '#021025' },
+			textColor: '#e6f0ff',
+		},
+		grid: {
+			vertLines: { color: 'rgba(255,255,255,0.05)' },
+			horzLines: { color: 'rgba(255,255,255,0.05)' },
+		},
+		width: container.offsetWidth,
+		height: container.offsetHeight,
+		timeScale: {
+			timeVisible: true,
+			secondsVisible: false,
+			borderColor: '#334155',
+		},
+		rightPriceScale: {
+			borderColor: '#334155',
+		},
+		crosshair: {
+			mode: LightweightCharts.CrosshairMode.Normal,
+		},
+		handleScroll: true,
+		handleScale: true,
+	});
+
+	lwCandlestickSeries = lwChart.addCandlestickSeries({
+		upColor: '#10b981',
+		downColor: '#ef4444',
+		borderUpColor: '#10b981',
+		borderDownColor: '#ef4444',
+		wickUpColor: '#10b981',
+		wickDownColor: '#ef4444',
+	});
+
+	// Junta histórico e forecast
+	const allCandles = ohlc.concat(forecastData.map(c => ({...c, forecast:true})));
+	// LW espera timestamps em segundos
+	const lwCandles = allCandles.map(c => ({
+		time: Math.floor(c.x/1000),
+		open: c.o,
+		high: c.h,
+		low: c.l,
+		close: c.c,
+		color: c.forecast ? '#38bdf8' : undefined // forecast azul
+	}));
+	lwCandlestickSeries.setData(lwCandles);
+
+	// Linhas horizontais Entry/Stop/Target
+	if (entry) {
+		lwEntryLine = lwChart.addLineSeries({ color: '#facc15', lineWidth: 2 });
+		lwEntryLine.setData([{ time: lwCandles[0].time, value: entry }, { time: lwCandles[lwCandles.length-1].time, value: entry }]);
+	}
+	if (stop) {
+		lwStopLine = lwChart.addLineSeries({ color: '#ef4444', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed });
+		lwStopLine.setData([{ time: lwCandles[0].time, value: stop }, { time: lwCandles[lwCandles.length-1].time, value: stop }]);
+	}
+	if (target) {
+		lwTargetLine = lwChart.addLineSeries({ color: '#10b981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed });
+		lwTargetLine.setData([{ time: lwCandles[0].time, value: target }, { time: lwCandles[lwCandles.length-1].time, value: target }]);
+	}
+
+	lwChart.timeScale().fitContent();
+}
 
 // ---------- FUNÇÃO DE COPIA DE TEXTO ----------
 function copyToClipboard(text, element) {
@@ -1108,7 +1185,7 @@ async function runPipeline(symbol, interval, lookback) {
 		};
 		
 		// Inicializa o gráfico (agora com a correção do zoom)
-		initChart(alignedOhlc, forecastSim.preds, bbHistorical, forecastBB);
+	initChartLW(alignedOhlc, forecastSim.preds, entryPrice, stopPrice, targetPrice);
 		
 		const signalData = {
 			symbol: symbol,
@@ -1201,7 +1278,24 @@ async function initialize() {
 	runPipeline('SOL', '1h', 6);
 }
 
-document.addEventListener('DOMContentLoaded', initialize);
+// Carregamento dinâmico do Lightweight Charts
+function loadLightweightCharts(callback) {
+    if (window.LightweightCharts) {
+        callback();
+        return;
+    }
+    var script = document.createElement('script');
+    script.src = 'https://unpkg.com/lightweight-charts/dist/lightweight-charts.js';
+    script.onload = callback;
+    document.head.appendChild(script);
+}
+
+// Envolva a inicialização do app para garantir que LightweightCharts está carregado
+window.addEventListener('DOMContentLoaded', function() {
+    loadLightweightCharts(function() {
+        initialize();
+    });
+});
 
 </script>
 </body>
